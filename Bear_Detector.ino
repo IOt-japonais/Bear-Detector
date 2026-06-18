@@ -86,8 +86,8 @@
 #define UPLOAD_URL          "http://" ANDROID_IP ":" STR(ANDROID_PORT) UPLOAD_PATH
 
 // GPIO
-#define PIN_PIR             14
-#define PIN_LDR             13
+#define PIN_PIR             13
+#define PIN_LDR             14
 #define PIN_LED_MOSFET      15
 
 // Timing
