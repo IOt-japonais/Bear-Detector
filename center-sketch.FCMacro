@@ -1,0 +1,400 @@
+# -*- coding: utf-8 -*-
+# =============================================================================
+# CenterSketchOnOrigin.FCMacro
+#
+# Purpose:
+#   Centers a FreeCAD sketch on the global XY origin (0, 0, 0) WITHOUT
+#   opening the sketch in Sketcher edit mode.
+#
+# Workflow:
+#   1. Select a Sketch object in the model tree or 3-D view (single click).
+#   2. Run this macro.
+#   3. A crosshair cursor appears — click the point in the 3-D view that
+#      you want to become the new origin.  The click does NOT need to land
+#      on existing geometry; empty space above the sketch plane is fine.
+#   4. The macro projects the click onto the sketch plane and translates the
+#      sketch so that projected point is exactly at (0, 0, 0).
+#
+# What is preserved:
+#   * All sketch geometry, constraints, and dimensions
+#   * The sketch's orientation (rotation / MapMode / attachment)
+#   * All attachment references
+#   Only Placement.Base (the position) changes.
+#
+# Compatibility: FreeCAD 0.20 through 1.x on Windows, Linux, and macOS.
+# =============================================================================
+
+import FreeCAD
+import FreeCADGui
+
+# ---------------------------------------------------------------------------
+# PySide compatibility shim
+# FreeCAD bundles Qt bindings whose name varies by build:
+#   FreeCAD <= 0.20 / older macOS  -> PySide2
+#   FreeCAD 0.21+  / newer macOS   -> PySide6
+#   All builds also expose         -> PySide  (thin re-export, always present)
+# ---------------------------------------------------------------------------
+try:
+    from PySide2 import QtCore, QtGui, QtWidgets
+except ModuleNotFoundError:
+    try:
+        from PySide6 import QtCore, QtGui, QtWidgets
+        # PySide6 moved enum members into namespaced sub-classes.
+        # Alias them back to the PySide2 locations so the rest of the code
+        # is version-agnostic.
+        QtCore.Qt.CrossCursor            = QtCore.Qt.CursorShape.CrossCursor
+        QtCore.Qt.ArrowCursor            = QtCore.Qt.CursorShape.ArrowCursor
+        QtCore.Qt.LeftButton             = QtCore.Qt.MouseButton.LeftButton
+        QtCore.Qt.RightButton            = QtCore.Qt.MouseButton.RightButton
+        QtCore.QEvent.MouseButtonRelease = QtCore.QEvent.Type.MouseButtonRelease
+    except ModuleNotFoundError:
+        from PySide import QtCore, QtGui, QtWidgets   # FreeCAD built-in alias
+
+
+# ---------------------------------------------------------------------------
+# Helper – find a sketch from the current GUI selection
+# ---------------------------------------------------------------------------
+def get_selected_sketch():
+    """
+    Return the first Sketcher::SketchObject in the current selection, or
+    None.  Covers both model-tree clicks and 3-D-view clicks.
+    """
+    for sel in FreeCADGui.Selection.getSelection():
+        if sel.TypeId == "Sketcher::SketchObject":
+            return sel
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Helper – sketch world-space plane
+# ---------------------------------------------------------------------------
+def sketch_plane_in_world(sketch):
+    """
+    Return (origin_w, normal_w) as FreeCAD.Vector objects describing the
+    sketch plane in world coordinates.
+
+    FreeCAD resolves all attachment modes into sketch.Placement before
+    exposing it to Python, so this works for every kind of sketch:
+    attached to a face, to an origin plane, or free-standing.
+
+    The sketch lies in its local XY plane, so its world normal is the
+    local Z axis (0, 0, 1) rotated by the placement's quaternion.
+    """
+    pl       = sketch.Placement
+    origin_w = pl.Base
+    normal_w = pl.Rotation.multVec(FreeCAD.Vector(0, 0, 1))
+    return origin_w, normal_w
+
+
+# ---------------------------------------------------------------------------
+# Helper – locate the Qt widget used for 3-D rendering
+# ---------------------------------------------------------------------------
+def find_viewport_widget(view):
+    """
+    Return the QWidget that renders the active 3-D view, compatible with
+    FreeCAD 0.20 through 1.x.
+
+    Also returns a 'view_widget' — the outermost widget whose coordinate
+    space matches what view.getPoint() expects.  These two can differ:
+    the event filter must be installed on the innermost render surface so
+    we receive raw mouse events, but the coordinates passed to getPoint()
+    must be relative to the top-left of the entire view area.
+
+    Returns: (event_widget, view_widget)
+      event_widget – widget to install the event filter on
+      view_widget  – widget whose local coordinates feed view.getPoint()
+    """
+
+    # -- Strategy 1: legacy API (FreeCAD <= 0.21) ------------------------
+    get_gl = getattr(view, "getGLWidget", None)
+    if get_gl is not None:
+        try:
+            w = get_gl()
+            if w is not None:
+                # In older builds the GL widget IS the view widget
+                return w, w
+        except Exception:
+            pass
+
+    # -- Strategy 2: graphicsView() (some 1.x builds) --------------------
+    gv_fn = getattr(view, "graphicsView", None)
+    if gv_fn is not None:
+        try:
+            w = gv_fn()
+            if w is not None:
+                return w, w
+        except Exception:
+            pass
+
+    # -- Strategy 3: walk the Qt widget tree (FreeCAD 1.0+) ---------------
+    # The 3-D view lives inside a QMdiSubWindow.  We want:
+    #   event_widget = deepest QOpenGLWidget (actual render surface)
+    #   view_widget  = the sub-window's central widget (coordinate origin
+    #                  that view.getPoint() uses)
+    view_title = None
+    try:
+        view_title = view.getWindowTitle()
+    except Exception:
+        pass
+
+    for tl in QtWidgets.QApplication.topLevelWidgets():
+        mdi = tl.findChild(QtWidgets.QMdiArea)
+        if mdi is None:
+            continue
+        for sub in mdi.subWindowList():
+            if view_title and view_title not in sub.windowTitle():
+                continue
+            central = sub.widget()
+            if central is None:
+                continue
+            # Innermost OpenGL surface for event capture
+            gl = central.findChild(QtWidgets.QOpenGLWidget)
+            event_w = gl if gl is not None else central
+            # The central widget's coordinate space = view.getPoint() space
+            return event_w, central
+
+    # Absolute fallback: focused widget (coordinates may be slightly off)
+    focused = QtWidgets.QApplication.focusWidget()
+    if focused is not None:
+        return focused, focused
+
+    return None, None
+
+
+# ---------------------------------------------------------------------------
+# The mouse-event filter
+# ---------------------------------------------------------------------------
+class ClickCaptureFilter(QtCore.QObject):
+    """
+    Temporary Qt event filter installed on the 3-D viewport render widget.
+
+    Left-click  : project the screen point onto the sketch plane, move the
+                  sketch so that world point becomes (0,0,0), remove self.
+    Right-click : cancel without any change, remove self.
+    """
+
+    def __init__(self, sketch):
+        super().__init__()
+        self._sketch = sketch
+        self._view   = FreeCADGui.ActiveDocument.ActiveView
+
+        # Locate the two widgets we need (see find_viewport_widget docstring)
+        self._event_widget, self._view_widget = find_viewport_widget(self._view)
+
+        if self._event_widget is None:
+            raise RuntimeError(
+                "Could not locate the 3-D viewport Qt widget.\n"
+                "Please report this together with your FreeCAD version."
+            )
+
+        # Crosshair cursor signals that a click is expected
+        self._event_widget.setCursor(QtGui.QCursor(QtCore.Qt.CrossCursor))
+
+        # Install on the innermost render surface so we see raw mouse events
+        self._event_widget.installEventFilter(self)
+
+        FreeCAD.Console.PrintMessage(
+            "CenterSketchOnOrigin: sketch '{}' selected. "
+            "Click anywhere in the 3-D view to set the new center point. "
+            "Right-click to cancel.\n".format(sketch.Label)
+        )
+
+    # ------------------------------------------------------------------
+    def eventFilter(self, watched, event):
+        """Intercept mouse-button events; pass everything else through."""
+
+        if event.type() == QtCore.QEvent.MouseButtonRelease:
+
+            if event.button() == QtCore.Qt.LeftButton:
+                # --------------------------------------------------------
+                # Get click position in the VIEW widget's coordinate space.
+                #
+                # Problem: event.pos() / event.position() is relative to
+                # the widget the filter is installed on (the innermost GL
+                # surface).  view.getPoint() however expects coordinates
+                # relative to the top-left of the entire view area
+                # (self._view_widget).
+                #
+                # Fix: map the global cursor position into _view_widget's
+                # local coordinate space.  QCursor.pos() is always in
+                # global screen coordinates, so mapFromGlobal() gives the
+                # correct local position regardless of widget nesting depth.
+                # --------------------------------------------------------
+                global_pos = QtGui.QCursor.pos()
+                local_pos  = self._view_widget.mapFromGlobal(global_pos)
+                x, y       = local_pos.x(), local_pos.y()
+
+                world_pt = self._screen_to_plane_point(x, y)
+
+                if world_pt is not None:
+                    self._center_sketch(world_pt)
+                else:
+                    QtWidgets.QMessageBox.critical(
+                        None,
+                        "CenterSketchOnOrigin",
+                        "Could not project the click onto the sketch plane.\n\n"
+                        "This happens when the camera ray is parallel to the "
+                        "sketch surface.\nTry rotating the view slightly and "
+                        "clicking again.",
+                    )
+
+                self._cleanup()
+                return True   # event consumed
+
+            elif event.button() == QtCore.Qt.RightButton:
+                FreeCAD.Console.PrintMessage(
+                    "CenterSketchOnOrigin: cancelled by user.\n"
+                )
+                self._cleanup()
+                return True
+
+        return False   # all other events pass through unchanged
+
+    # ------------------------------------------------------------------
+    def _screen_to_plane_point(self, x, y):
+        """
+        Project view-local pixel (x, y) onto the sketch plane and return
+        the intersection as a FreeCAD.Vector in world coordinates, or None.
+
+        Ray construction
+        ----------------
+        view.getPoint(x, y)      -- 3-D point on the camera near clip-plane
+                                     for this pixel (handles both ortho and
+                                     perspective projections automatically)
+        view.getViewDirection()  -- unit ray direction (camera → scene)
+
+        Plane intersection
+        ------------------
+        t           = ((plane_origin - ray_origin) . plane_normal)
+                      / (ray_direction . plane_normal)
+        intersection = ray_origin + t * ray_direction
+        """
+        try:
+            near_pt   = FreeCAD.Vector(*self._view.getPoint(x, y))
+            direction = FreeCAD.Vector(*self._view.getViewDirection())
+
+            origin_w, normal_w = sketch_plane_in_world(self._sketch)
+
+            denom = direction.dot(normal_w)
+            if abs(denom) < 1e-10:
+                FreeCAD.Console.PrintWarning(
+                    "CenterSketchOnOrigin: camera ray is parallel to the "
+                    "sketch plane; cannot intersect.\n"
+                )
+                return None
+
+            t           = (origin_w - near_pt).dot(normal_w) / denom
+            world_point = near_pt + direction * t
+            return world_point
+
+        except Exception as exc:
+            FreeCAD.Console.PrintError(
+                "CenterSketchOnOrigin: ray-plane intersection failed: "
+                "{}\n".format(exc)
+            )
+            return None
+
+    # ------------------------------------------------------------------
+    def _center_sketch(self, click_world):
+        """
+        Translate the sketch so click_world moves to (0, 0, 0).
+
+        Math:
+          P = current Placement.Base  (sketch world-origin before move)
+          C = click_world             (the point we want at origin)
+          new_base = P - C
+
+        Proof: after the move, C is at  C + (new_base - P) = C - C = 0. ✓
+
+        Only Placement.Base changes; Rotation is preserved, so all
+        geometry, constraints, and dimensions (which live in the sketch's
+        local frame) are automatically unaffected.
+        """
+        sketch        = self._sketch
+        current_pl    = sketch.Placement
+        new_base      = current_pl.Base - click_world
+        new_placement = FreeCAD.Placement(new_base, current_pl.Rotation)
+
+        FreeCAD.ActiveDocument.openTransaction("Center Sketch on Origin")
+        try:
+            sketch.Placement = new_placement
+            FreeCAD.ActiveDocument.recompute()
+            FreeCAD.ActiveDocument.commitTransaction()
+            FreeCAD.Console.PrintMessage(
+                "CenterSketchOnOrigin: done. "
+                "Sketch '{}' moved — world point "
+                "({:.4f}, {:.4f}, {:.4f}) is now at the origin.\n".format(
+                    sketch.Label,
+                    click_world.x, click_world.y, click_world.z,
+                )
+            )
+        except Exception as exc:
+            FreeCAD.ActiveDocument.abortTransaction()
+            FreeCAD.Console.PrintError(
+                "CenterSketchOnOrigin: failed to move sketch: {}\n".format(exc)
+            )
+            QtWidgets.QMessageBox.critical(
+                None,
+                "CenterSketchOnOrigin",
+                "Failed to move the sketch:\n{}".format(exc),
+            )
+
+    # ------------------------------------------------------------------
+    def _cleanup(self):
+        """Remove the event filter, restore the cursor, release GC ref."""
+        try:
+            self._event_widget.removeEventFilter(self)
+            self._event_widget.setCursor(QtGui.QCursor(QtCore.Qt.ArrowCursor))
+        except Exception:
+            pass
+        try:
+            del FreeCADGui._centerSketchFilter
+        except AttributeError:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+def main():
+
+    # 1. A document must be open
+    if FreeCAD.ActiveDocument is None:
+        QtWidgets.QMessageBox.warning(
+            None, "CenterSketchOnOrigin",
+            "No active FreeCAD document found.\nPlease open a document first.",
+        )
+        return
+
+    # 2. A sketch must be selected (no edit mode required)
+    sketch = get_selected_sketch()
+    if sketch is None:
+        QtWidgets.QMessageBox.warning(
+            None, "CenterSketchOnOrigin",
+            "No Sketch is selected.\n\n"
+            "Click a Sketch object once in the model tree or 3-D view to "
+            "select it, then run this macro again.\n\n"
+            "The sketch does NOT need to be opened in edit mode.",
+        )
+        return
+
+    # 3. An active 3-D view must exist
+    view = FreeCADGui.ActiveDocument.ActiveView
+    if view is None:
+        QtWidgets.QMessageBox.warning(
+            None, "CenterSketchOnOrigin",
+            "No active 3-D view found.\nCannot capture a mouse click.",
+        )
+        return
+
+    # 4. Install the click-capture filter.
+    #    Stored on FreeCADGui to prevent premature garbage collection.
+    try:
+        FreeCADGui._centerSketchFilter = ClickCaptureFilter(sketch)
+    except RuntimeError as exc:
+        QtWidgets.QMessageBox.critical(
+            None, "CenterSketchOnOrigin", str(exc)
+        )
+
+
+main()
